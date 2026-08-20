@@ -1,0 +1,20 @@
+{
+  "capture": "20260805T014626Z_1992p5_1912p5_5MHz_5s_15db_gps_demo",
+  "capture_duration_s": 5.0,
+  "sample_rate_hz": 5760000,
+  "prb": 25,
+  "ports": 1,
+  "phich_resources": "1/6",
+  "phich_length": "normal",
+  "cp": "normal",
+  "minimum_crc_valid_ul": 241,
+  "reference_crc_valid_ul": 243,
+  "legacy_tool_candidates": {
+    "ltesniffer": ["/media/morty/X10 Pro/Desktop-backup/LTEsniffer_offline/tools/bin/LTESniffer"],
+    "aligner": ["/media/morty/X10 Pro/Desktop-backup/LTEsniffer_offline/x300_raw_duplex_offline/build/align_duplex_lte"],
+    "ul_probe": ["/media/morty/X10 Pro/Desktop-backup/LTEsniffer_offline/x300_raw_duplex_offline/build/ul_grant_probe"]
+  },
+  "cells": [
+    {"label":"pci427_demo","pci":427,"start_s":0.0,"duration_s":4.95,"end_s":4.95,"source_start_s":4.0,"source_end_s":8.95,"cfo_hz":2163.77637,"eci_28bit":2866331,"logical_satellite_id":11196,"sector_id":155,"tac_hex":"ca0e","ul_result":"pci427","minimum_ul_crc":241,"reference_ul_crc":243}
+  ]
+}

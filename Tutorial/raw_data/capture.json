@@ -1,0 +1,40 @@
+{
+  "format": {
+    "datatype": "fc32",
+    "endianness": "little",
+    "layout": "separate_files_sample_aligned",
+    "channels": 2,
+    "channel_0": "downlink",
+    "channel_1": "uplink"
+  },
+  "capture": {
+    "status": "complete_excerpt",
+    "dl_file": "downlink.fc32",
+    "ul_file": "uplink.fc32",
+    "dl_frequency_hz": 1992500000,
+    "ul_frequency_hz": 1912500000,
+    "sample_rate_hz": 10000000,
+    "bandwidth_hz_ch0": 40000000,
+    "bandwidth_hz_ch1": 120000000,
+    "gain_db_ch0": 35,
+    "gain_db_ch1": 15,
+    "sample_count_per_channel": 50000000,
+    "duration_seconds": 5.0,
+    "first_device_time_seconds": 4.25,
+    "last_device_time_seconds": 9.2499999,
+    "layout": "separate little-endian fc32 files; sample n is simultaneous across files"
+  },
+  "capture_utc": "20260805T014626Z",
+  "excerpt": {
+    "source_capture": "20260805T014622Z_1992p5_1912p5_5MHz_150s_15db_gps",
+    "source_start_seconds": 4.0,
+    "source_end_seconds": 9.0,
+    "selection_reason": "Dense PCI 427 interval containing broadcast SIBs, connection setup, identity, authentication, security signaling, timing advance, and CRC-valid uplink traffic."
+  },
+  "integrity": {
+    "equal_sample_counts": true,
+    "hardware_timed_common_start": true,
+    "overflow_free_in_source_capture": true,
+    "byte_verified_against_source": true
+  }
+}
