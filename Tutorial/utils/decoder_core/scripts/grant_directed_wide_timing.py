@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Reacquire known LTE UL grants over a wide, grant-directed timing window.
+"""Decode LTE UL grants with a DL-directed fast pass and wide fallback.
 
-Unlike the blind 10x8 DMRS table search, each timing/CFO candidate is ranked
-using the exact DCI/RAR grant PCI, subframe sequence, cyclic shift, and RB
-allocation. This prevents a wide NTN timing window from anchoring to an
-unrelated neighboring PUSCH transmission.
+Each exact DCI/RAR grant is first searched at its DL-scheduled subframe over a
+narrow timing window. Decoding stops for that grant after a valid transport-
+block CRC. Only unresolved grants enter the burst-associated wide timing/DMRS
+search, so the completeness fallback is retained without paying for it on
+already-decoded packets.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from burst_first_ul_decode_v2 import (
-    decode_grant,
+    decode_grant_hypotheses,
     grant_for_allocation,
     rrc_hypotheses,
     standards_grants,
@@ -41,6 +42,10 @@ def arguments() -> argparse.Namespace:
         Path(__file__).resolve().parents[1] / "build" / "ul_grant_probe"))
     parser.add_argument("--radius-ms", type=float, default=1.5)
     parser.add_argument(
+        "--fast-radius-ms", type=float, default=0.75,
+        help="DL-directed first-pass radius before the wide fallback",
+    )
+    parser.add_argument(
         "--grant-delta-sf", type=int, default=2,
         help="test grants within this many grid subframes of a detected burst",
     )
@@ -57,34 +62,178 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def acquire_expected(args: argparse.Namespace, task: dict) -> dict:
-    burst, allocation, grant = task["burst"], task["allocation"], task["grant"]
+def acquire_expected_group(args: argparse.Namespace, tasks: list[dict],
+                           radius_ms: float) -> list[dict]:
+    """Acquire exact DMRS candidates once for grants sharing time/RBs."""
+    first = tasks[0]
+    burst, allocation = first["burst"], first["allocation"]
+    sequence_keys = []
+    for task in tasks:
+        key = (int(task["grant"]["tti"]) % 10,
+               int(task["grant"]["n_dmrs"]))
+        if key not in sequence_keys:
+            sequence_keys.append(key)
     command = [
         str(args.probe), "--input", str(args.input),
         "--target-sf", str(burst["burst_sf"]),
-        "--radius-ms", str(args.radius_ms),
-        "--pci", str(args.pci), "--tti", str(grant["tti"]),
+        "--radius-ms", str(radius_ms),
+        "--pci", str(args.pci), "--tti", "0",
         "--prb", str(allocation["prb0"]),
         "--prb-slot1", str(allocation["prb1"]),
         "--len-prb", str(allocation["len_prb"]),
-        "--n-dmrs", str(grant["n_dmrs"]), "--top",
-        str(args.timing_candidates),
+        "--n-dmrs", "0", "--top", str(args.timing_candidates),
+        "--sequence-keys", ",".join(
+            f"{sf_idx}:{n_dmrs}" for sf_idx, n_dmrs in sequence_keys
+        ),
     ]
     run = subprocess.run(command, text=True, capture_output=True)
-    physicals = []
+    physicals_by_sequence = defaultdict(list)
     for line in run.stdout.splitlines():
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(item.get("rank"), int):
-            physicals.append(item)
-    physicals.sort(key=lambda item: int(item["rank"]))
-    return {
-        **task, "physicals": physicals,
+        if item.get("sequence_key_top"):
+            key = (int(item["sf_idx"]), int(item["n_dmrs"]))
+            physical = {
+                name: value for name, value in item.items()
+                if name not in {"sequence_key_top", "sequence_rank"}
+            }
+            physical["rank"] = len(physicals_by_sequence[key]) + 1
+            physicals_by_sequence[key].append(physical)
+    return [{
+        **task,
+        "physicals": physicals_by_sequence.get(
+            (int(task["grant"]["tti"]) % 10,
+             int(task["grant"]["n_dmrs"])),
+            [],
+        ),
         "acquire_return_code": run.returncode,
         "acquire_stderr": run.stderr.strip(),
-    }
+    } for task in tasks]
+
+
+def grant_key(grant: dict) -> tuple[int, ...]:
+    return tuple(int(grant[name]) for name in (
+        "file_sf", "tti", "rnti", "prb_tilde0", "prb_tilde1", "len_prb",
+        "n_dmrs", "mcs", "tbs", "rv", "mod", "nof_ack", "cqi_request",
+    ))
+
+
+def acquire_tasks(args: argparse.Namespace, tasks: list[dict],
+                  radius_ms: float, label: str) -> tuple[list[dict], int]:
+    task_groups = defaultdict(list)
+    for task in tasks:
+        allocation = task["allocation"]
+        key = (
+            int(task["burst"]["burst_sf"]), int(allocation["prb0"]),
+            int(allocation["prb1"]), int(allocation["len_prb"]),
+        )
+        task_groups[key].append(task)
+    acquired = []
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, args.workers)) as pool:
+        futures = [
+            pool.submit(acquire_expected_group, args, group, radius_ms)
+            for group in task_groups.values()
+        ]
+        for completed, future in enumerate(
+                concurrent.futures.as_completed(futures), 1):
+            acquired.extend(future.result())
+            if completed % 100 == 0:
+                print(
+                    f"{label}: acquired {completed}/{len(task_groups)} "
+                    "grouped exact-grant windows"
+                )
+    return acquired, len(task_groups)
+
+
+def accepted_candidates(args: argparse.Namespace,
+                        acquired: list[dict]) -> list[dict]:
+    accepted = []
+    for item in acquired:
+        for physical in item["physicals"]:
+            if (float(physical["snr_db"]) >= args.dmrs_min_snr_db and
+                    float(physical.get("coherence", 0.0)) >=
+                    args.dmrs_min_coherence):
+                accepted.append({**item, "physical": physical})
+    return accepted
+
+
+def decode_until_crc(args: argparse.Namespace, candidates: list[dict],
+                     configs: dict, radius_ms: float,
+                     already_attempted: set[tuple] | None = None) -> list[dict]:
+    """Try ranked candidates for one grant and stop after its first CRC hit."""
+    hypothesis_args = SimpleNamespace(unknown_uci="both")
+    probe_args = SimpleNamespace(
+        input=args.input, probe=args.probe, radius_ms=radius_ms,
+    )
+    attempted = already_attempted or set()
+    ordered = sorted(candidates, key=lambda item: (
+        abs(int(item["grant_minus_burst_sf"])),
+        int(item["physical"]["rank"]),
+        -float(item["physical"]["snr_db"]),
+    ))
+    results = []
+    for item in ordered:
+        physical = item["physical"]
+        physical_key = (
+            int(physical["file_sample"]),
+            round(float(physical["correction_hz"]), 3),
+            int(physical["sf_idx"]), int(physical["n_dmrs"]),
+        )
+        if physical_key in attempted:
+            continue
+        attempted.add(physical_key)
+        acquisition = {"allocation": item["allocation"], "pci": args.pci}
+        ucis = rrc_hypotheses(item["grant"], configs, hypothesis_args)
+        for uci in ucis:
+            decoded = decode_grant_hypotheses(
+                probe_args, item["burst"], acquisition, item["grant"],
+                physical, [uci],
+            )[0]
+            attempt = {
+                "burst_sf": int(item["burst"]["burst_sf"]),
+                "pci": args.pci,
+                "allocation": item["allocation"],
+                "grant_minus_burst_sf": item["grant_minus_burst_sf"],
+                "dmrs": physical,
+                "recovery_source": item["recovery_source"],
+                **decoded,
+            }
+            results.append(attempt)
+            if attempt["crc_valid"]:
+                return results
+    return results
+
+
+def decode_grant_groups(args: argparse.Namespace, accepted: list[dict],
+                        configs: dict, radius_ms: float,
+                        prior_attempts: list[dict] | None = None) -> list[dict]:
+    grouped = defaultdict(list)
+    for item in accepted:
+        grouped[grant_key(item["grant"])].append(item)
+    prior_by_grant = defaultdict(set)
+    for item in prior_attempts or []:
+        physical = item["dmrs"]
+        prior_by_grant[grant_key(item["grant"])].add((
+            int(physical["file_sample"]),
+            round(float(physical["correction_hz"]), 3),
+            int(physical["sf_idx"]), int(physical["n_dmrs"]),
+        ))
+    attempts = []
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, args.workers)) as pool:
+        future_map = {
+            pool.submit(
+                decode_until_crc, args, candidates, configs, radius_ms,
+                prior_by_grant.get(key, set()),
+            ): key
+            for key, candidates in grouped.items()
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            attempts.extend(future.result())
+    return attempts
 
 
 def main() -> int:
@@ -93,11 +242,12 @@ def main() -> int:
                  *args.rrc_pcap]:
         if not path.is_file():
             raise SystemExit(f"missing input: {path}")
-    if (args.radius_ms <= 0 or args.grant_delta_sf < 0 or
+    if (args.radius_ms <= 0 or args.fast_radius_ms <= 0 or
+            args.fast_radius_ms > args.radius_ms or args.grant_delta_sf < 0 or
             args.timing_candidates <= 0):
         raise SystemExit(
-            "radius and timing-candidate count must be positive; "
-            "grant delta must be nonnegative"
+            "radii and timing-candidate count must be positive; fast radius "
+            "must not exceed fallback radius; grant delta must be nonnegative"
         )
 
     bursts = [
@@ -134,55 +284,59 @@ def main() -> int:
                 })
     tasks = list(tasks_by_key.values())
 
-    acquired = []
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, args.workers)) as pool:
-        futures = [pool.submit(acquire_expected, args, task) for task in tasks]
-        for completed, future in enumerate(
-                concurrent.futures.as_completed(futures), 1):
-            acquired.append(future.result())
-            if completed % 250 == 0:
-                print(f"acquired {completed}/{len(tasks)} exact-grant windows")
-
-    accepted = []
-    for item in acquired:
-        for physical in item["physicals"]:
-            if (float(physical["snr_db"]) >= args.dmrs_min_snr_db and
-                    float(physical.get("coherence", 0.0)) >=
-                    args.dmrs_min_coherence):
-                accepted.append({**item, "physical": physical})
-
-    configs = extract_rrc_configs_many(args.rrc_pcap)
-    hypothesis_args = SimpleNamespace(unknown_uci="both")
-    probe_args = SimpleNamespace(
-        input=args.input, probe=args.probe, radius_ms=args.radius_ms,
-    )
-    decode_tasks = []
-    for item in accepted:
-        acquisition = {"allocation": item["allocation"], "pci": args.pci}
-        for uci in rrc_hypotheses(item["grant"], configs, hypothesis_args):
-            decode_tasks.append((item, acquisition, uci))
-
-    attempts = []
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, args.workers)) as pool:
-        future_map = {
-            pool.submit(
-                decode_grant, probe_args, item["burst"], acquisition,
-                item["grant"], item["physical"], uci,
-            ): item
-            for item, acquisition, uci in decode_tasks
+    # Phase 1: trust the DL grant's scheduled subframe, RB allocation, DMRS
+    # sequence, MCS/TBS, and RRC-derived UCI first. No burst alias is needed.
+    unique_grants = {}
+    for task in tasks:
+        unique_grants.setdefault(grant_key(task["grant"]), task["grant"])
+    fast_tasks = []
+    for grant in unique_grants.values():
+        allocation = {
+            "prb0": int(grant["prb_tilde0"]),
+            "prb1": int(grant["prb_tilde1"]),
+            "len_prb": int(grant["len_prb"]),
         }
-        for future in concurrent.futures.as_completed(future_map):
-            item = future_map[future]
-            attempts.append({
-                "burst_sf": int(item["burst"]["burst_sf"]),
-                "pci": args.pci,
-                "allocation": item["allocation"],
-                "grant_minus_burst_sf": item["grant_minus_burst_sf"],
-                "dmrs": item["physical"],
-                **future.result(),
-            })
+        fast_tasks.append({
+            "burst": {"burst_sf": int(grant["file_sf"])},
+            "allocation": allocation,
+            "grant": grant,
+            "grant_minus_burst_sf": 0,
+            "recovery_source": "dl_directed_fast",
+        })
+
+    fast_acquired, fast_windows = acquire_tasks(
+        args, fast_tasks, args.fast_radius_ms, "fast DL pass"
+    )
+    fast_accepted = accepted_candidates(args, fast_acquired)
+    configs = extract_rrc_configs_many(args.rrc_pcap)
+    fast_attempts = decode_grant_groups(
+        args, fast_accepted, configs, args.fast_radius_ms,
+    )
+    solved_fast = {
+        grant_key(item["grant"]) for item in fast_attempts
+        if item["crc_valid"]
+    }
+
+    # Phase 2: only grants without a fast-pass CRC enter the original ±wide
+    # burst/DMRS association. This is the completeness-preserving fallback.
+    fallback_tasks = []
+    for task in tasks:
+        if grant_key(task["grant"]) in solved_fast:
+            continue
+        fallback_tasks.append({
+            **task, "recovery_source": "wide_burst_dmrs_fallback",
+        })
+    fallback_acquired, fallback_windows = acquire_tasks(
+        args, fallback_tasks, args.radius_ms, "wide fallback"
+    )
+    fallback_accepted = accepted_candidates(args, fallback_acquired)
+    fallback_attempts = decode_grant_groups(
+        args, fallback_accepted, configs, args.radius_ms,
+        prior_attempts=fast_attempts,
+    )
+    attempts = fast_attempts + fallback_attempts
+    acquired = fast_acquired + fallback_acquired
+    accepted = fast_accepted + fallback_accepted
 
     attempts.sort(key=lambda item: (
         int(item["grant"]["file_sf"]), int(item["grant"]["rnti"]),
@@ -229,10 +383,22 @@ def main() -> int:
     summary = {
         "input": str(args.input), "pci": args.pci,
         "radius_ms": args.radius_ms,
+        "fast_radius_ms": args.fast_radius_ms,
+        "fallback_radius_ms": args.radius_ms,
         "timing_candidates_per_grant": args.timing_candidates,
         "grant_delta_sf": args.grant_delta_sf,
         "detected_bursts_reused": len(bursts),
+        "unique_dl_grants": len(unique_grants),
         "grant_directed_timing_tasks": len(tasks),
+        "fast_grouped_timing_windows": fast_windows,
+        "fast_dmrs_accepted": len(fast_accepted),
+        "fast_decode_attempts": len(fast_attempts),
+        "fast_crc_valid_grants": len(solved_fast),
+        "fallback_grants": len(unique_grants) - len(solved_fast),
+        "fallback_timing_tasks": len(fallback_tasks),
+        "fallback_grouped_timing_windows": fallback_windows,
+        "fallback_dmrs_accepted": len(fallback_accepted),
+        "fallback_decode_attempts": len(fallback_attempts),
         "dmrs_accepted": len(accepted),
         "decode_attempts": len(attempts),
         "crc_valid_packets": len(unique_valid),

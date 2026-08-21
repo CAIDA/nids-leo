@@ -64,6 +64,7 @@ struct Options {
   std::string diag_output;
   std::string sweep_output;
   std::string sweep_rntis;
+  std::string sequence_keys;
 };
 
 struct PairSample {
@@ -93,11 +94,12 @@ void usage(const char* program)
       "          --pci PCI --tti TTI --prb START --len-prb N --n-dmrs N\n"
       "          [--prb-slot1 START] [--top N] [--sweep-sequence]\n"
       "          [--sequence-table]\n"
+      "          [--sequence-keys SF:NDMRS,...]\n"
       "          [--center-lag-samples N]\n"
       "          [--fixed-lag-samples N --fixed-correction-hz HZ]\n"
       "          [--decode --rnti RNTI --mcs MCS --tbs BITS --rv RV\n"
       "           --mod qpsk|16qam|64qam|256qam --nof-ack 0|1|2\n"
-      "           --cqi-type none|wideband|subband-ue|subband-hl\n"
+      "           --cqi-type none|wideband|subband-ue|subband-hl|both\n"
       "           --ri-len 0|1 --pmi-present\n"
       "           --offset-ack N --offset-cqi N --offset-ri N\n"
       "           --decode-top N --diag-output FILE.json\n"
@@ -140,6 +142,7 @@ bool parse_options(int argc, char** argv, Options& options)
       {"fixed-lag-samples", required_argument, nullptr, 'L'},
       {"fixed-correction-hz", required_argument, nullptr, 'F'},
       {"center-lag-samples", required_argument, nullptr, 1008},
+      {"sequence-keys", required_argument, nullptr, 1009},
       {"help", no_argument, nullptr, 'h'},
       {nullptr, 0, nullptr, 0},
   };
@@ -194,6 +197,7 @@ bool parse_options(int argc, char** argv, Options& options)
       case 1008:
         options.center_lag_samples = std::strtoll(optarg, nullptr, 10);
         break;
+      case 1009: options.sequence_keys = optarg; break;
       default: usage(argv[0]); return false;
     }
   }
@@ -217,12 +221,13 @@ bool parse_options(int argc, char** argv, Options& options)
   const bool cqi_valid =
       options.cqi_type == "none" || options.cqi_type == "wideband" ||
       options.cqi_type == "subband-ue" || options.cqi_type == "subband-hl";
+  const bool cqi_batch_valid = options.cqi_type == "both";
   return options.rnti > 0 && options.rnti <= 65535 && options.mcs <= 31 &&
          options.tbs > 0 && options.tbs % 8 == 0 && options.rv <= 3 &&
          options.nof_ack <= 2 && options.ri_len <= 1 &&
          options.offset_ack <= 15 && options.offset_cqi <= 15 &&
          options.offset_ri <= 15 && options.decode_top > 0 &&
-         modulation_valid && cqi_valid;
+         modulation_valid && (cqi_valid || cqi_batch_valid);
 }
 
 float cp_metric(const cf_t* samples, uint32_t count, float* phase)
@@ -594,8 +599,19 @@ int main(int argc, char** argv)
   const int64_t search_center_sample = center_sample + options.center_lag_samples;
   const int64_t radius_samples =
       static_cast<int64_t>(std::llround(options.radius_ms * sample_rate / 1000.0));
-  const int64_t first_candidate = std::max<int64_t>(0, search_center_sample - radius_samples);
-  const int64_t last_candidate = search_center_sample + radius_samples;
+  // A fixed-lag invocation is the second, CRC-decoding stage: the wide
+  // acquisition pass has already chosen the exact boundary and CFO.  The old
+  // path nevertheless reread and CP-scanned the full timing radius before
+  // discarding every discovered peak.  Restrict fixed-lag reads to the chosen
+  // subframe while leaving non-fixed acquisition byte-for-byte unchanged.
+  const int64_t fixed_file_sample = center_sample + options.fixed_lag_samples;
+  const int64_t first_candidate = options.fixed_lag
+                                      ? fixed_file_sample
+                                      : std::max<int64_t>(
+                                            0, search_center_sample - radius_samples);
+  const int64_t last_candidate = options.fixed_lag
+                                     ? fixed_file_sample
+                                     : search_center_sample + radius_samples;
   const int64_t read_start = std::max<int64_t>(0, first_candidate - 64);
   const uint64_t read_count =
       static_cast<uint64_t>(last_candidate - read_start) + sf_len + fft_size + 64;
@@ -636,22 +652,24 @@ int main(int argc, char** argv)
     float phase;
   };
   std::vector<CpPeak> peaks;
-  const size_t scan_begin = static_cast<size_t>(first_candidate - read_start);
-  const size_t scan_end = std::min<size_t>(
-      static_cast<size_t>(last_candidate - read_start),
-      ul.size() - sf_len - fft_size - cp_probe_len);
-  for (size_t p = scan_begin + 1; p + 1 < scan_end; ++p) {
-    float phase = 0.0f;
-    const float metric = cp_metric(&ul[p], cp_probe_len, &phase);
-    if (metric < 0.55f) {
-      continue;
-    }
-    float left_phase = 0.0f;
-    float right_phase = 0.0f;
-    const float left = cp_metric(&ul[p - 1], cp_probe_len, &left_phase);
-    const float right = cp_metric(&ul[p + 1], cp_probe_len, &right_phase);
-    if (metric >= left && metric > right) {
-      peaks.push_back({p, metric, phase});
+  if (!options.fixed_lag) {
+    const size_t scan_begin = static_cast<size_t>(first_candidate - read_start);
+    const size_t scan_end = std::min<size_t>(
+        static_cast<size_t>(last_candidate - read_start),
+        ul.size() - sf_len - fft_size - cp_probe_len);
+    for (size_t p = scan_begin + 1; p + 1 < scan_end; ++p) {
+      float phase = 0.0f;
+      const float metric = cp_metric(&ul[p], cp_probe_len, &phase);
+      if (metric < 0.55f) {
+        continue;
+      }
+      float left_phase = 0.0f;
+      float right_phase = 0.0f;
+      const float left = cp_metric(&ul[p - 1], cp_probe_len, &left_phase);
+      const float right = cp_metric(&ul[p + 1], cp_probe_len, &right_phase);
+      if (metric >= left && metric > right) {
+        peaks.push_back({p, metric, phase});
+      }
     }
   }
   std::sort(peaks.begin(), peaks.end(), [](const CpPeak& a, const CpPeak& b) {
@@ -659,7 +677,6 @@ int main(int argc, char** argv)
   });
   std::vector<CpPeak> selected;
   if (options.fixed_lag) {
-    const int64_t fixed_file_sample = center_sample + options.fixed_lag_samples;
     if (fixed_file_sample < read_start ||
         fixed_file_sample + static_cast<int64_t>(sf_len + fft_size + cp_probe_len) >
             read_start + static_cast<int64_t>(ul.size())) {
@@ -726,6 +743,31 @@ int main(int argc, char** argv)
   const uint32_t nrefs_per_slot = options.len_prb * SRSRAN_NRE;
   std::vector<cf_t> received(2 * nrefs_per_slot);
   std::vector<Candidate> results;
+  std::vector<std::pair<uint32_t, uint32_t>> requested_sequences;
+  if (!options.sequence_keys.empty()) {
+    std::istringstream stream(options.sequence_keys);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+      const size_t colon = token.find(':');
+      if (colon == std::string::npos) {
+        std::fprintf(stderr, "invalid sequence key: %s\n", token.c_str());
+        srsran_enb_ul_free(&enb_ul);
+        return 2;
+      }
+      const uint32_t sf_idx = std::strtoul(token.substr(0, colon).c_str(), nullptr, 10);
+      const uint32_t n_dmrs = std::strtoul(token.substr(colon + 1).c_str(), nullptr, 10);
+      if (sf_idx >= 10 || n_dmrs >= SRSRAN_NOF_CSHIFT) {
+        std::fprintf(stderr, "sequence key out of range: %s\n", token.c_str());
+        srsran_enb_ul_free(&enb_ul);
+        return 2;
+      }
+      const std::pair<uint32_t, uint32_t> key{sf_idx, n_dmrs};
+      if (std::find(requested_sequences.begin(), requested_sequences.end(), key) ==
+          requested_sequences.end()) {
+        requested_sequences.push_back(key);
+      }
+    }
+  }
 
   for (const CpPeak& peak : selected) {
     const float cp_cfo_hz = peak.phase * sample_rate /
@@ -756,12 +798,22 @@ int main(int argc, char** argv)
       srsran_refsignal_dmrs_pusch_get(
           &enb_ul.chest.dmrs_signal, &pusch, enb_ul.sf_symbols, received.data());
 
-      const uint32_t sf_begin = options.sweep_sequence ? 0 : options.tti % 10;
-      const uint32_t sf_end = options.sweep_sequence ? 10 : sf_begin + 1;
-      const uint32_t dmrs_begin = options.sweep_sequence ? 0 : options.n_dmrs;
-      const uint32_t dmrs_end = options.sweep_sequence ? SRSRAN_NOF_CSHIFT : dmrs_begin + 1;
-      for (uint32_t sf_idx = sf_begin; sf_idx < sf_end; ++sf_idx) {
-        for (uint32_t n_dmrs = dmrs_begin; n_dmrs < dmrs_end; ++n_dmrs) {
+      std::vector<std::pair<uint32_t, uint32_t>> sequences = requested_sequences;
+      if (sequences.empty()) {
+        const uint32_t sf_begin = options.sweep_sequence ? 0 : options.tti % 10;
+        const uint32_t sf_end = options.sweep_sequence ? 10 : sf_begin + 1;
+        const uint32_t dmrs_begin = options.sweep_sequence ? 0 : options.n_dmrs;
+        const uint32_t dmrs_end =
+            options.sweep_sequence ? SRSRAN_NOF_CSHIFT : dmrs_begin + 1;
+        for (uint32_t sf_idx = sf_begin; sf_idx < sf_end; ++sf_idx) {
+          for (uint32_t n_dmrs = dmrs_begin; n_dmrs < dmrs_end; ++n_dmrs) {
+            sequences.push_back({sf_idx, n_dmrs});
+          }
+        }
+      }
+      for (const auto& sequence : sequences) {
+          const uint32_t sf_idx = sequence.first;
+          const uint32_t n_dmrs = sequence.second;
           const cf_t* known = enb_ul.chest.dmrs_pregen.r[n_dmrs][sf_idx][options.len_prb];
           const float coherence =
               dmrs_coherence(received.data(), known, nrefs_per_slot);
@@ -788,7 +840,6 @@ int main(int argc, char** argv)
               chest_result.snr_db,
               chest_result.ta_us,
           });
-        }
       }
     }
   }
@@ -846,6 +897,42 @@ int main(int argc, char** argv)
         result.ta_us);
   }
 
+  // A grouped acquisition asks for several exact DCI/RAR DMRS sequences that
+  // share one burst boundary and RB allocation. Emit an independent top-N for
+  // each sequence so grouping changes only computation reuse, never ranking.
+  for (const auto& sequence : requested_sequences) {
+    size_t sequence_rank = 0;
+    for (const Candidate& result : results) {
+      if (result.sf_idx != sequence.first || result.n_dmrs != sequence.second) {
+        continue;
+      }
+      ++sequence_rank;
+      if (sequence_rank > options.top) {
+        break;
+      }
+      std::printf(
+          "{\"sequence_key_top\":true,\"sequence_rank\":%zu,"
+          "\"lag_samples\":%lld,\"lag_us\":%.3f,"
+          "\"file_sample\":%llu,\"cp\":%.6f,\"cp_cfo_hz\":%.3f,"
+          "\"correction_hz\":%.3f,\"cfo_branch\":%d,"
+          "\"sf_idx\":%u,\"n_dmrs\":%u,\"coherence\":%.6f,"
+          "\"snr_db\":%.3f,\"ta_us\":%.3f}\n",
+          sequence_rank,
+          static_cast<long long>(result.lag_samples),
+          static_cast<double>(result.lag_samples) * 1e6 / sample_rate,
+          static_cast<unsigned long long>(result.file_sample),
+          result.cp,
+          result.cp_cfo_hz,
+          result.correction_hz,
+          result.cfo_branch,
+          result.sf_idx,
+          result.n_dmrs,
+          result.coherence,
+          result.snr_db,
+          result.ta_us);
+    }
+  }
+
   /*
    * A global top-N sweep can mix several CP peaks and CFO aliases.  For grant
    * association the caller needs all 10x8 LTE DMRS sequence scores evaluated
@@ -896,6 +983,25 @@ int main(int argc, char** argv)
   }
 
   if (options.decode) {
+    const std::vector<std::string> decode_cqi_types =
+        options.cqi_type == "both"
+            ? std::vector<std::string>{"none", "wideband"}
+            : std::vector<std::string>{options.cqi_type};
+    size_t cqi_hypothesis_index = 0;
+    for (const std::string& decode_cqi_type : decode_cqi_types) {
+    if (cqi_hypothesis_index++ > 0) {
+      // srsRAN keeps decoder work state inside enb_ul.pusch. Each hypothesis
+      // must begin with the same clean state as an independent invocation.
+      srsran_enb_ul_free(&enb_ul);
+      enb_ul = {};
+      if (srsran_enb_ul_init(&enb_ul, time_buffer.data(), nof_prb) !=
+              SRSRAN_SUCCESS ||
+          srsran_enb_ul_set_cell(&enb_ul, cell, &dmrs, nullptr) !=
+              SRSRAN_SUCCESS) {
+        std::fprintf(stderr, "srsRAN hypothesis-state reset failed\n");
+        return 1;
+      }
+    }
     pusch.rnti = static_cast<uint16_t>(options.rnti);
     pusch.max_nof_iterations = 12;
     pusch.enable_64qam =
@@ -904,15 +1010,15 @@ int main(int argc, char** argv)
     pusch.uci_offset.I_offset_cqi = options.offset_cqi;
     pusch.uci_offset.I_offset_ri = options.offset_ri;
     pusch.uci_cfg.ack[0].nof_acks = options.nof_ack;
-    pusch.uci_cfg.cqi.data_enable = options.cqi_type != "none";
+    pusch.uci_cfg.cqi.data_enable = decode_cqi_type != "none";
     pusch.uci_cfg.cqi.pmi_present = options.pmi_present;
     pusch.uci_cfg.cqi.rank_is_not_one = false;
     pusch.uci_cfg.cqi.four_antenna_ports = false;
     pusch.uci_cfg.cqi.ri_len = options.ri_len;
     pusch.uci_cfg.cqi.N = srsran_cqi_hl_get_no_subbands(cell.nof_prb);
-    if (options.cqi_type == "wideband") {
+    if (decode_cqi_type == "wideband") {
       pusch.uci_cfg.cqi.type = SRSRAN_CQI_TYPE_WIDEBAND;
-    } else if (options.cqi_type == "subband-ue") {
+    } else if (decode_cqi_type == "subband-ue") {
       pusch.uci_cfg.cqi.type = SRSRAN_CQI_TYPE_SUBBAND_UE;
     } else {
       pusch.uci_cfg.cqi.type = SRSRAN_CQI_TYPE_SUBBAND_HL;
@@ -1069,6 +1175,7 @@ int main(int argc, char** argv)
       }
     }
     srsran_softbuffer_rx_free(&softbuffer);
+    }
   }
 
   srsran_enb_ul_free(&enb_ul);

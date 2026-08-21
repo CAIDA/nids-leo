@@ -336,8 +336,33 @@ def rrc_hypotheses(grant: dict, configs: dict[int, dict],
     } for value in values]
 
 
-def decode_grant(args: argparse.Namespace, burst: dict, acquisition: dict,
-                 grant: dict, expected: dict, uci: dict) -> dict:
+def decode_grant_hypotheses(args: argparse.Namespace, burst: dict,
+                            acquisition: dict, grant: dict, expected: dict,
+                            ucis: list[dict]) -> list[dict]:
+    """Decode one physical candidate for one or both bounded CQI hypotheses.
+
+    The probe's ``both`` mode reuses one process, IQ read, and srsRAN setup for
+    the common ``none``/``wideband`` pair. Other combinations retain the
+    original one-invocation-per-hypothesis behavior.
+    """
+    if not ucis:
+        return []
+    shared_fields = ("ri_len", "offset_ack", "offset_cqi", "offset_ri")
+    batchable = (
+        len(ucis) == 2 and
+        [str(uci["cqi_type"]) for uci in ucis] == ["none", "wideband"] and
+        all(all(uci[field] == ucis[0][field] for field in shared_fields)
+            for uci in ucis[1:])
+    )
+    if not batchable and len(ucis) > 1:
+        return [
+            decode_grant_hypotheses(
+                args, burst, acquisition, grant, expected, [uci]
+            )[0]
+            for uci in ucis
+        ]
+
+    primary_uci = ucis[0]
     allocation = acquisition["allocation"]
     command = [
         str(args.probe), "--input", str(args.input),
@@ -355,13 +380,14 @@ def decode_grant(args: argparse.Namespace, burst: dict, acquisition: dict,
         "--tbs", str(grant["tbs"]), "--rv", str(grant["rv"]),
         "--mod", MODULATION[int(grant["mod"])],
         "--nof-ack", str(grant["nof_ack"]),
-        "--cqi-type", str(uci["cqi_type"]), "--ri-len", str(uci["ri_len"]),
-        "--offset-ack", str(uci["offset_ack"]),
-        "--offset-cqi", str(uci["offset_cqi"]),
-        "--offset-ri", str(uci["offset_ri"]), "--decode-top", "1",
+        "--cqi-type", "both" if batchable else str(primary_uci["cqi_type"]),
+        "--ri-len", str(primary_uci["ri_len"]),
+        "--offset-ack", str(primary_uci["offset_ack"]),
+        "--offset-cqi", str(primary_uci["offset_cqi"]),
+        "--offset-ri", str(primary_uci["offset_ri"]), "--decode-top", "1",
     ]
     run = subprocess.run(command, text=True, capture_output=True)
-    decoded = None
+    decoded = []
     physical = None
     for line in run.stdout.splitlines():
         try:
@@ -371,13 +397,25 @@ def decode_grant(args: argparse.Namespace, burst: dict, acquisition: dict,
         if item.get("rank") == 1:
             physical = item
         if item.get("decode_rank") == 1:
-            decoded = item
-    return {
-        "grant": grant, "uci": uci, "physical": physical, "decode": decoded,
-        "crc_valid": bool(decoded and decoded.get("crc") and
-                          not decoded.get("all_zero")),
-        "return_code": run.returncode, "stderr": run.stderr.strip(),
-    }
+            decoded.append(item)
+    results = []
+    for index, uci in enumerate(ucis):
+        decoded_item = decoded[index] if index < len(decoded) else None
+        results.append({
+            "grant": grant, "uci": uci, "physical": physical,
+            "decode": decoded_item,
+            "crc_valid": bool(decoded_item and decoded_item.get("crc") and
+                              not decoded_item.get("all_zero")),
+            "return_code": run.returncode, "stderr": run.stderr.strip(),
+        })
+    return results
+
+
+def decode_grant(args: argparse.Namespace, burst: dict, acquisition: dict,
+                 grant: dict, expected: dict, uci: dict) -> dict:
+    return decode_grant_hypotheses(
+        args, burst, acquisition, grant, expected, [uci]
+    )[0]
 
 
 def main() -> int:
@@ -430,6 +468,13 @@ def main() -> int:
             bool(burst["candidate_allocations"]) for burst in bursts),
     }
     (args.output_dir / "inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
+    # The authoritative wide-timing stage only needs energy boundaries and
+    # candidate allocations. Persist that audit before the optional early
+    # return so callers can skip this script's redundant DMRS/CRC pass.
+    audit_path = args.output_dir / "burst_audit.jsonl"
+    with audit_path.open("w") as output:
+        for burst in bursts:
+            output.write(json.dumps(burst, separators=(",", ":")) + "\n")
     if args.inventory_only:
         print(json.dumps(inventory))
         return 0

@@ -391,6 +391,7 @@ class TutorialPipeline:
                     "--pci", str(cell["pci"]), "--output-dir", str(preliminary),
                     "--rrc-pcap", str(paths["rrc_pcap"]), "--rrc-pcap", str(paths["dl_pcap"]),
                     "--probe", str(probe), "--radius-ms", "0.35", "--workers", "4",
+                    "--inventory-only",
                 ]
             )
         self._run(
@@ -400,7 +401,8 @@ class TutorialPipeline:
                 "--burst-audit", str(burst_audit), "--pci", str(cell["pci"]),
                 "--output-dir", str(output), "--rrc-pcap", str(paths["rrc_pcap"]),
                 "--rrc-pcap", str(paths["dl_pcap"]), "--probe", str(probe),
-                "--radius-ms", "5.0", "--timing-candidates", "4", "--workers", "4",
+                "--fast-radius-ms", "0.75", "--radius-ms", "5.0",
+                "--timing-candidates", "4", "--workers", "4",
             ]
         )
         generated_crc = sum(bool(line.strip()) for line in crc_path.read_text().splitlines()) if crc_path.is_file() else -1

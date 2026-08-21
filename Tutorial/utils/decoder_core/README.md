@@ -21,6 +21,16 @@ libraries are external build dependencies. Set `LTESNIFFER_BIN` and
 Cached intermediate artifacts are used by default so every visualization can
 be reproduced without spending hours rerunning the PHY decoder.
 
+The authoritative UL stage first uses each DL DCI/RAR grant's scheduled
+subframe, RB allocation, DMRS sequence, MCS/TBS, and RRC-derived UCI settings
+in a +/-0.75 ms timing window. It tests ranked candidates and UCI hypotheses
+in order and stops that grant immediately after its first valid transport-
+block CRC. Only unresolved grants enter the +/-5 ms burst/DMRS fallback.
+Grants sharing a boundary and allocation reuse one timing/CFO scan, and an
+already-selected physical candidate does not repeat the wide CP scan. The
+fallback retains the original timing radius, four candidates, hypotheses,
+turbo decoding, and CRC rules, so fast-pass misses do not become packet loss.
+
 Build the two included srsRAN-based helpers with:
 
 ```bash

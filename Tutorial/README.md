@@ -65,3 +65,8 @@ change these estimates.
 The notebook expects the two 400 MB, 10 MS/s excerpt files in
 `Tutorial/raw_data/`. The complete 150-second IQ is deliberately
 not required by the tutorial.
+
+If the three raw-data files are absent, the first executable notebook cell
+downloads them from the configured public Google Drive folder with `gdown` and
+validates both IQ sizes before continuing. Existing valid files are never
+downloaded again.

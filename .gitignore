@@ -12,6 +12,7 @@
 /Tutorial/outputs/
 /Tutorial/figures/
 /Tutorial/executed/
+/Tutorial/.raw_data_download/
 /Tutorial/*-executed.ipynb
 /Tutorial/*.nbconvert.ipynb
 /Tutorial/*.html
