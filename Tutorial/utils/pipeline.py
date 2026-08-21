@@ -247,7 +247,8 @@ class TutorialPipeline:
             "uplink_center_hz": 1_912_500_000,
             "identity_note": (
                 "logical_satellite_id is the conventional 20-bit eNB portion of the "
-                "28-bit SIB1 ECI; it is not a NORAD spacecraft ID."
+                "28-bit SIB1 ECI and, in Tsat, identifies the real-world satellite; "
+                "the low 8 bits identify its beam/sector. This is a Tsat identifier, not necessarily a NORAD catalog number."
             ),
         }
         for cell in manifest["cells"]:

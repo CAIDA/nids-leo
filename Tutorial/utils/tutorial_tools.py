@@ -172,7 +172,7 @@ def summarize_downlink(results_dir: Path, manifest: dict) -> list[dict]:
                 "start (s)": cell["start_s"],
                 "end (s)": cell["end_s"],
                 "ECI": cell.get("eci_28bit", "not decoded"),
-                "logical satellite": cell.get("logical_satellite_id", "unresolved"),
+                "Tsat satellite ID": cell.get("logical_satellite_id", "unresolved"),
                 "sector": cell.get("sector_id", "unresolved"),
                 "DL frames": _pcap_frame_count(pcap),
             }
@@ -224,6 +224,7 @@ def plot_ul_grants(
     *,
     start_s: float,
     duration_s: float,
+    observed_rows: list[dict] | None = None,
     sample_rate_hz: float = LTE_RATE_HZ,
     center_hz: float = 1_912_500_000,
 ):
@@ -231,16 +232,25 @@ def plot_ul_grants(
         ul_path, sample_rate_hz, start_s, duration_s, fft_size=2048, rows=700
     )
     frequency_mhz = (center_hz + offsets) / 1e6
-    fig, axis = plt.subplots(figsize=(15, 7))
-    image = axis.imshow(
-        power,
-        origin="upper",
-        aspect="auto",
-        extent=[frequency_mhz[0], frequency_mhz[-1], times[-1], times[0]],
-        cmap="magma",
-        vmin=-48,
-        vmax=0,
+    fig, axes = plt.subplots(
+        2, 1, figsize=(12, 8.5), sharex=True, sharey=True, layout="constrained"
     )
+    images = []
+    for axis in axes:
+        images.append(axis.imshow(
+            power,
+            origin="upper",
+            aspect="auto",
+            extent=[frequency_mhz[0], frequency_mhz[-1], times[-1], times[0]],
+            cmap="magma",
+            vmin=-48,
+            vmax=0,
+        ))
+    signal_axis, grant_axis = axes
+    signal_axis.set_title("Observed uplink signal (no scheduling overlay)")
+    observed_by_sf = {
+        int(row["burst_sf"]): row for row in (observed_rows or [])
+    }
     shown = 0
     for row in acquisitions:
         event_s = _grant_time(row, cell)
@@ -253,27 +263,59 @@ def plot_ul_grants(
             ((center_hz + low_hz) / 1e6, event_s),
             width_hz / 1e6,
             0.001,
-            fill=False,
+            facecolor=(0.0, 0.9, 1.0, 0.14),
             edgecolor="#00e5ff",
-            linewidth=1.6,
+            linewidth=2.2,
         )
-        axis.add_patch(rectangle)
+        grant_axis.add_patch(rectangle)
+        observed = observed_by_sf.get(int(row["burst"]["burst_sf"]))
+        if observed is not None:
+            observed_s = (
+                float(cell["start_s"])
+                + float(cell.get("aligned_start_offset_s", 0.0))
+                + int(observed["physical"]["file_sample"]) / sample_rate_hz
+            )
+            grant_axis.add_patch(Rectangle(
+                ((center_hz + low_hz) / 1e6, observed_s),
+                width_hz / 1e6,
+                0.001,
+                facecolor=(0.2, 1.0, 0.2, 0.10),
+                edgecolor="#66ff66",
+                linestyle="--",
+                linewidth=2.2,
+            ))
+        if shown < 4:
+            prb_start = int(grant["prb_tilde0"])
+            prb_end = prb_start + int(grant["len_prb"]) - 1
+            grant_axis.annotate(
+                f"sf {int(row['burst']['burst_sf'])}: PRBs {prb_start}–{prb_end}",
+                xy=((center_hz + low_hz + width_hz / 2) / 1e6, event_s + 0.0005),
+                xytext=(12, 14),
+                textcoords="offset points",
+                color="white",
+                fontsize=8,
+                arrowprops={"arrowstyle": "->", "color": "#00e5ff"},
+                bbox={"facecolor": "black", "alpha": 0.75, "edgecolor": "#00e5ff"},
+            )
         shown += 1
-    axis.set_title(
-        f"PCI {cell['pci']}: DL DCI0 grant rectangles over the observed UL waterfall"
+    grant_axis.set_title(
+        f"PCI {cell['pci']}: expected grant window versus CRC-valid observed window"
     )
-    axis.set_xlabel("Uplink frequency (MHz)")
-    axis.set_ylabel("Seconds after capture start")
-    axis.text(
+    grant_axis.set_xlabel("Uplink frequency (MHz)")
+    for axis in axes:
+        axis.set_ylabel("Seconds after capture start")
+    grant_axis.text(
         0.01,
         0.02,
-        f"{shown} grants in view; cyan = scheduled PRBs for one 1 ms subframe",
-        transform=axis.transAxes,
+        f"{shown} grant in view; cyan = expected, dashed green = observed after timing search",
+        transform=grant_axis.transAxes,
         color="white",
         bbox={"facecolor": "black", "alpha": 0.65},
     )
-    fig.colorbar(image, ax=axis, label="Relative power (dB)", pad=0.01)
-    fig.tight_layout()
+    fig.colorbar(
+        images[0], ax=axes, label="Relative power (dB)", pad=0.02, shrink=0.92
+    )
+    fig.suptitle("Recorded UL signal: scheduled position and observed decoded position")
     return fig
 
 
@@ -313,15 +355,15 @@ def summarize_uplink(results_dir: Path, manifest: dict) -> list[dict]:
     for cell in manifest["cells"]:
         label = cell.get("ul_result")
         if not label:
-            rows.append({"PCI": cell["pci"], "segment": cell["label"], "grants": 0, "DMRS matches": 0, "decode attempts": 0, "CRC passed": 0})
+            rows.append({"PCI": cell["pci"], "segment": cell["label"], "unique DL grants": 0, "DMRS candidates": 0, "decode attempts": 0, "CRC passed": 0})
             continue
         summary = json.loads((results_dir / "uplink" / label / "summary.json").read_text())
         rows.append(
             {
                 "PCI": cell["pci"],
                 "segment": cell["label"],
-                "grants": summary["grant_directed_timing_tasks"],
-                "DMRS matches": summary["dmrs_accepted"],
+                "unique DL grants": summary.get("unique_dl_grants", summary["grant_directed_timing_tasks"]),
+                "DMRS candidates": summary["dmrs_accepted"],
                 "decode attempts": summary["decode_attempts"],
                 "CRC passed": summary["crc_valid_packets"],
             }
